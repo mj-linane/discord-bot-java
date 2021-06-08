@@ -1,11 +1,20 @@
 import net.dv8tion.jda.api.audio.AudioReceiveHandler;
 import net.dv8tion.jda.api.audio.AudioSendHandler;
 import net.dv8tion.jda.api.audio.CombinedAudio;
+import net.dv8tion.jda.api.audio.UserAudio;
 import net.dv8tion.jda.api.entities.*;
 import net.dv8tion.jda.api.events.message.guild.GuildMessageReceivedEvent;
 import net.dv8tion.jda.api.hooks.ListenerAdapter;
 import net.dv8tion.jda.api.managers.AudioManager;
 
+import javax.sound.sampled.AudioFormat;
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.LineUnavailableException;
+import javax.sound.sampled.TargetDataLine;
+import java.io.DataInputStream;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Queue;
@@ -26,14 +35,14 @@ public class VoiceHandler extends ListenerAdapter {
         if (author.isBot())
             return;
 
-        if (content.startsWith("!echo "))
+        if (content.startsWith("!silence "))
         {
             String arg = content.substring("!echo ".length());
-            onEchoCommand(event, guild, arg);
+            onSilenceCommand(event, guild, arg);
         }
-        else if (content.equals("!echo"))
+        else if (content.equals("!silence"))
         {
-            onEchoCommand(event);
+            onSilenceCommand(event);
         }
     }
 
@@ -44,14 +53,13 @@ public class VoiceHandler extends ListenerAdapter {
      * @param event
      *        The event for this command
      */
-    private void onEchoCommand(GuildMessageReceivedEvent event)
+    private void onSilenceCommand(GuildMessageReceivedEvent event)
     {
         // Note: None of these can be null due to our configuration with the JDABuilder!
         Member member = event.getMember();                              // Member is the context of the user for the specific guild, containing voice state and roles
-        assert member != null;
         GuildVoiceState voiceState = member.getVoiceState();            // Check the current voice state of the user
-        assert voiceState != null;
         VoiceChannel channel = voiceState.getChannel();                 // Use the channel the user is currently connected to
+        User[] users = channel.
         if (channel != null)
         {
             connectTo(channel);                                         // Join the channel of the user
@@ -73,7 +81,7 @@ public class VoiceHandler extends ListenerAdapter {
      * @param arg
      *        The input argument
      */
-    private void onEchoCommand(GuildMessageReceivedEvent event, Guild guild, String arg)
+    private void onSilenceCommand(GuildMessageReceivedEvent event, Guild guild, String arg)
     {
         boolean isNumber = arg.matches("\\d+"); // This is a regular expression that ensures the input consists of digits
         VoiceChannel channel = null;
@@ -135,83 +143,70 @@ public class VoiceHandler extends ListenerAdapter {
         Guild guild = channel.getGuild();
         // Get an audio manager for this guild, this will be created upon first use for each guild
         AudioManager audioManager = guild.getAudioManager();
-        // Create our Send/Receive handler for the audio connection
-        EchoHandler handler = new EchoHandler();
+        // Create our Receive handler for the audio connection
+        SilenceHandler handler = new SilenceHandler();
+
 
         // The order of the following instructions does not matter!
-
-        // Set the sending handler to our echo system
-        audioManager.setSendingHandler(handler);
         // Set the receiving handler to the same echo system, otherwise we can't echo anything
         audioManager.setReceivingHandler(handler);
         // Connect to the voice channel
         audioManager.openAudioConnection(channel);
+
+        handler.handleUserAudio();
     }
 
-    public static class EchoHandler implements AudioSendHandler, AudioReceiveHandler
+    public static class SilenceHandler implements AudioReceiveHandler
     {
         /*
             All methods in this class are called by JDA threads when resources are available/ready for processing.
             The receiver will be provided with the latest 20ms of PCM stereo audio
-            Note you can receive even while setting yourself to deafened!
             The sender will provide 20ms of PCM stereo audio (pass-through) once requested by JDA
-            When audio is provided JDA will automatically set the bot to speaking!
          */
-        private final Queue<byte[]> queue = new ConcurrentLinkedQueue<>();
-
         /* Receive Handling */
 
-        @Override // combine multiple user audio-streams into a single one
-        public boolean canReceiveCombined()
-        {
-            // limit queue to 10 entries, if that is exceeded we can not receive more until the send system catches up
-            return queue.size() < 10;
-        }
-
-        @Override
-        public void handleCombinedAudio(CombinedAudio combinedAudio)
-        {
-            // we only want to send data when a user actually sent something, otherwise we would just send silence
-            if (combinedAudio.getUsers().isEmpty())
-                return;
-
-            byte[] data = combinedAudio.getAudioData(1.0f); // volume at 100% = 1.0 (50% = 0.5 / 55% = 0.55)
-            queue.add(data);
-        }
-/*
-        Disable per-user audio since we want to echo the entire channel and not specific users.
         @Override // give audio separately for each user that is speaking
         public boolean canReceiveUser()
         {
-            // this is not useful if we want to echo the audio of the voice channel, thus disabled for this purpose
-            return false;
-        }
-        @Override
-        public void handleUserAudio(UserAudio userAudio) {} // per-user is not helpful in an echo system
-*/
-
-        /* Send Handling */
-
-        @Override
-        public boolean canProvide()
-        {
-            // If we have something in our buffer we can provide it to the send system
-            return !queue.isEmpty();
+            return true;
         }
 
         @Override
-        public ByteBuffer provide20MsAudio()
-        {
-            // use what we have in our buffer to send audio as PCM
-            byte[] data = queue.poll();
-            return data == null ? null : ByteBuffer.wrap(data); // Wrap this in a java.nio.ByteBuffer
+        public void handleUserAudio(UserAudio userAudio) {
+            byte[] data = userAudio.getAudioData(1.0f); // volume at 100% = 1.0 (50% = 0.5 / 55% = 0.55)
+            checkIfTooLoud(data);
         }
 
-        @Override
-        public boolean isOpus()
+        private boolean checkIfTooLoud(byte[] audioData) throws LineUnavailableException
         {
-            // since we send audio that is received from discord we don't have opus but PCM
-            return false;
+            float sampleRate = 48000.0f;
+            int numChannels = 2;
+            int sampleSizeBits = 16;
+            double maxDB = 0;
+            InputStream stream = new InputStream();
+            AudioFormat format = new AudioFormat(sampleRate, sampleSizeBits, true, true);
+            TargetDataLine tdl = ;
+
+            tdl.open(format);
+            tdl.start();
+            if (!tdl.isOpen()) {
+                System.exit(1);
+            }
+
+            byte[] data = audioData;
+
+            int read = tdl.read(data, 0, (int) sampleRate);
+            if(read > 0){
+                for (int i = 0; i < read-1; i= i+2){
+                    float currentLevel = data[i].getLevel();
+//                    long val = ((data[i] & 0xffL) << 8L) | (data[i + 1] & 0xffL);
+//                    long valf = extendSign(val, 16);
+//                    System.out.println(i + "\t" + valf);
+                }
+            }
+            tdl.close();
+
+            
         }
     }
 }
